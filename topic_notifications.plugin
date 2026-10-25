@@ -2,7 +2,7 @@ __id__ = "topic_notifications"
 __name__ = "Topic Notifications"
 __description__ = "In forum groups, reading or sending in one topic only clears that topic's notifications. Other topics keep theirs. Normal chats are untouched."
 __author__ = "Justice"
-__version__ = "1.0.1"
+__version__ = "1.0.2"
 
 # How stock Telegram (and Nagram XF) handles reads in a forum group:
 #   * the server reports "read up to message N" for the whole group
@@ -22,8 +22,12 @@ __version__ = "1.0.1"
 #   3. removes only the notifications whose own topic has been read, then refreshes
 #      the notification shade silently (no new sound or vibration).
 # When the app reloads its pending notifications from the database (app start,
-# chat list refresh), messages of topics you already read can come back; a prune
-# pass after every reload removes them again.
+# chat list refresh, often right after you send), stock rebuilds the list in a way
+# that loses other topics: it skips the whole group while any topic of it is open,
+# and the database already counts every topic as read after a group wide read mark.
+# The plugin keeps a copy of each forum group's pending notifications from just
+# before the reload, puts back the ones whose topic you have not read, then prunes
+# the ones whose topic you have read.
 # Muting or clearing a whole group (removeNotificationsForDialog) still clears
 # everything, exactly like stock. Private chats, normal groups and channels are
 # never touched.
@@ -71,6 +75,7 @@ class TopicNotificationsPlugin(BasePlugin):
         self.read_max = {}          # (account, dialog_id, topic_id) -> highest read message id
         self.pending = set()        # (account, dialog_id) waiting for a prune pass
         self.clearing = set()       # (account, dialog_id) inside a stock "clear all" call
+        self.snapshots = {}         # account -> forum notifications from just before a reload
         self.lock = threading.Lock()
 
         nc_cls = find_class("org.telegram.messenger.NotificationsController")
@@ -115,6 +120,9 @@ class TopicNotificationsPlugin(BasePlugin):
         self.hook_method(mc_cls.getDeclaredMethod("markDialogAsRead", L, I, I, I, Z, L, I, Z, I), MarkDialogAsReadHook())
 
         class ReloadHook(MethodHook):
+            def before_hooked_method(self, param):
+                plugin._before_reload(param)
+
             def after_hooked_method(self, param):
                 plugin._after_reload(param)
 
@@ -213,7 +221,7 @@ class TopicNotificationsPlugin(BasePlugin):
                 value = int(arr.valueAt(i))
                 with self.lock:
                     clearing = (account, did) in self.clearing
-                if value == 0 and not clearing and _is_forum(account, did):
+                if value <= 0 and not clearing and _is_forum(account, did):
                     changed = True   # would wipe every topic; let the prune pass decide
                     self._schedule(account, did)
                 else:
@@ -223,7 +231,88 @@ class TopicNotificationsPlugin(BasePlugin):
         except Exception as e:
             self.log("processDialogsUpdateRead hook: %s" % e)
 
+    def _before_reload(self, param):
+        # Runs before the reload is queued, so this snapshot runs before it too.
+        account = _account_of(param.thisObject)
+
+        def snap():
+            try:
+                nc = NotificationsController.getInstance(account)
+                keep = []
+                for m in get_private_field(nc, "pushMessages").toArray():
+                    if m is None or m.messageOwner.from_scheduled or m.isStoryReactionPush or m.isStoryPush:
+                        continue
+                    if _is_forum(account, int(m.getDialogId())):
+                        keep.append(m)
+                with self.lock:
+                    self.snapshots[account] = keep
+            except Exception as e:
+                self.log("reload snapshot: %s" % e)
+
+        self.queue.postRunnable(R(snap))
+
+    def _restore_after_reload(self, account):
+        with self.lock:
+            saved = self.snapshots.pop(account, None)
+        if not saved:
+            return
+        nc = NotificationsController.getInstance(account)
+        push = get_private_field(nc, "pushMessages")
+        by_id = get_private_field(nc, "pushMessagesDict")
+        dialogs = get_private_field(nc, "pushDialogs")
+        opened = int(get_private_field(nc, "openedDialogId"))
+        opened_topic = int(get_private_field(nc, "openedTopicId"))
+        screen_on = bool(jclass("org.telegram.messenger.ApplicationLoader").isScreenOn)
+        present = set((int(m.getDialogId()), int(m.getId())) for m in push.toArray() if m is not None)
+        restored = 0
+        for m in saved:
+            did, mid, tid = int(m.getDialogId()), int(m.getId()), int(m.getTopicId())
+            if (did, mid) in present:
+                continue
+            if mid <= self._topic_read_max(account, did, tid):
+                continue   # that topic really was read
+            try:
+                if MessagesController.getInstance(account).isDialogMuted(did, tid):
+                    continue   # muted since, so the reload was right to drop it
+            except Exception:
+                pass
+            if did == opened and screen_on and (tid == opened_topic or opened_topic == 0):
+                continue   # you are looking at that topic right now
+            pos = 0
+            while pos < push.size() and push.get(pos).messageOwner.date > m.messageOwner.date:
+                pos += 1
+            push.add(pos, m)
+            arr = by_id.get(did)
+            if arr is None:
+                arr = jclass("android.util.SparseArray")()
+                by_id.put(did, arr)
+            arr.put(mid, m)
+            if dialogs.get(did) is None:
+                dialogs.put(did, jclass("java.lang.Integer")(1))
+                try:
+                    f = find_class("org.telegram.messenger.NotificationsController").getDeclaredField("total_unread_count")
+                    f.setAccessible(True)
+                    f.setInt(nc, f.getInt(nc) + 1)
+                except Exception:
+                    pass
+            present.add((did, mid))
+            restored += 1
+        if restored:
+            self.show_method.invoke(nc, jarray(JObject)([JBoolean(False)]))
+            run_on_ui_thread(lambda: NotificationCenter.getGlobalInstance().postNotificationName(NotificationCenter.pushMessagesUpdated))
+
     def _after_reload(self, param):
+        account = _account_of(param.thisObject)
+
+        def restore():
+            try:
+                self._restore_after_reload(account)
+            except Exception as e:
+                self.log("reload restore: %s" % e)
+
+        # Queued after the reload itself, so it sees the rebuilt list.
+        self.queue.postRunnable(R(restore))
+
         # The reload rebuilt the pending list from the database; prune every forum
         # group in it (runs after the reload on the same queue).
         try:
