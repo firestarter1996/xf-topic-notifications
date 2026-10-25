@@ -2,7 +2,7 @@ __id__ = "topic_notifications"
 __name__ = "Topic Notifications"
 __description__ = "In forum groups, reading or sending in one topic only clears that topic's notifications. Other topics keep theirs. Normal chats are untouched."
 __author__ = "Justice"
-__version__ = "1.0.2"
+__version__ = "1.0.3"
 
 # How stock Telegram (and Nagram XF) handles reads in a forum group:
 #   * the server reports "read up to message N" for the whole group
@@ -28,6 +28,13 @@ __version__ = "1.0.2"
 # The plugin keeps a copy of each forum group's pending notifications from just
 # before the reload, puts back the ones whose topic you have not read, then prunes
 # the ones whose topic you have read.
+# Groups that show topics as tabs (like a busy bot group) have one more trap:
+# after a group wide read mark the app raises every topic's own read mark in its
+# database too. So the plugin trusts only reads that name a topic (opening it here,
+# a topic read reported by the server from another device, or sending into it).
+# Stock also never notifies about a group while any of its topics is open on
+# screen; with this plugin, new messages in OTHER topics still notify while you
+# sit in one topic. Messages in the topic you are looking at stay silent.
 # Muting or clearing a whole group (removeNotificationsForDialog) still clears
 # everything, exactly like stock. Private chats, normal groups and channels are
 # never touched.
@@ -77,6 +84,8 @@ class TopicNotificationsPlugin(BasePlugin):
         self.clearing = set()       # (account, dialog_id) inside a stock "clear all" call
         self.snapshots = {}         # account -> forum notifications from just before a reload
         self.lock = threading.Lock()
+        self.open_gen = 0           # bumps on every setOpenedDialogId call
+        self.reentry = threading.local()
 
         nc_cls = find_class("org.telegram.messenger.NotificationsController")
         mc_cls = find_class("org.telegram.messenger.MessagesController")
@@ -119,6 +128,20 @@ class TopicNotificationsPlugin(BasePlugin):
         self.hook_method(nc_cls.getDeclaredMethod("removeNotificationsForDialog", L), RemoveForDialogHook())
         self.hook_method(mc_cls.getDeclaredMethod("markDialogAsRead", L, I, I, I, Z, L, I, Z, I), MarkDialogAsReadHook())
 
+        class OpenedHook(MethodHook):
+            def before_hooked_method(self, param):
+                with plugin.lock:
+                    plugin.open_gen += 1
+
+        class NewMessagesHook(MethodHook):
+            def before_hooked_method(self, param):
+                plugin._before_new_messages(param)
+
+        self.hook_method(nc_cls.getDeclaredMethod("setOpenedDialogId", L, L), OpenedHook())
+        for m in nc_cls.getDeclaredMethods():
+            if m.getName() == "processNewMessages":
+                self.hook_method(m, NewMessagesHook())
+
         class ReloadHook(MethodHook):
             def before_hooked_method(self, param):
                 plugin._before_reload(param)
@@ -150,15 +173,13 @@ class TopicNotificationsPlugin(BasePlugin):
                 self.read_max[key] = int(max_id)
 
     def _topic_read_max(self, account, dialog_id, topic_id):
+        # Only reads that name this topic count: a read inside the topic here, a
+        # topic read reported by the server (other devices), or a send into it.
+        # The app's own topic objects are not used: after a group wide read mark
+        # (sending anywhere in the group) the app raises every topic's read mark
+        # locally, which would wrongly clear topics you have not opened.
         with self.lock:
-            best = self.read_max.get((account, dialog_id, topic_id), 0)
-        try:
-            topic = MessagesController.getInstance(account).getTopicsController().findTopic(-dialog_id, topic_id)
-            if topic is not None and topic.read_inbox_max_id > best:
-                best = int(topic.read_inbox_max_id)
-        except Exception:
-            pass
-        return best
+            return self.read_max.get((account, dialog_id, topic_id), 0)
 
     # ---------- hooks ----------
 
@@ -331,6 +352,71 @@ class TopicNotificationsPlugin(BasePlugin):
                     self._schedule(account, did)
         except Exception as e:
             self.log("reload hook: %s" % e)
+
+    def _before_new_messages(self, param):
+        # Stock drops every new message of a group while any of its chats is open
+        # on screen. In a forum that means replies in OTHER topics never notify
+        # while you sit in one topic. Those messages are handed to the same
+        # method again, with the open group hidden from that one pass only.
+        if getattr(self.reentry, "on", False):
+            return
+        try:
+            msgs = param.args[0]
+            if msgs is None or msgs.size() == 0:
+                return
+            nc = param.thisObject
+            account = _account_of(nc)
+            opened = int(get_private_field(nc, "openedDialogId"))
+            if opened == 0 or not _is_forum(account, opened):
+                return
+            opened_topic = int(get_private_field(nc, "openedTopicId"))
+            if opened_topic == 0:
+                return   # the whole group is open (flat view): stock is right
+            ArrayList = jclass("java.util.ArrayList")
+            others = ArrayList()
+            keep = ArrayList()
+            for m in msgs.toArray():
+                try:
+                    if m is not None and int(m.getDialogId()) == opened and int(m.getTopicId()) != opened_topic:
+                        others.add(m)
+                        continue
+                except Exception:
+                    pass
+                keep.add(m)
+            if others.size() == 0:
+                return
+            with self.lock:
+                gen = self.open_gen
+            state = {"swapped": False}
+            field = find_class("org.telegram.messenger.NotificationsController").getDeclaredField("openedDialogId")
+            field.setAccessible(True)
+
+            def hide():
+                with self.lock:
+                    same = self.open_gen == gen
+                if same and int(field.getLong(nc)) == opened:
+                    field.setLong(nc, 0)
+                    state["swapped"] = True
+
+            def unhide():
+                if not state["swapped"]:
+                    return
+                with self.lock:
+                    same = self.open_gen == gen
+                if same and int(field.getLong(nc)) == 0:
+                    field.setLong(nc, opened)
+
+            self.queue.postRunnable(R(hide))
+            self.reentry.on = True
+            try:
+                nc.processNewMessages(others, param.args[1], param.args[2], None)
+            finally:
+                self.reentry.on = False
+            self.queue.postRunnable(R(unhide))
+            param.args[0] = keep
+        except Exception as e:
+            self.reentry.on = False
+            self.log("new messages hook: %s" % e)
 
     def on_update_hook(self, update_name, account, update):
         try:
