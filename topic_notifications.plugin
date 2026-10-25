@@ -1,0 +1,346 @@
+__id__ = "topic_notifications"
+__name__ = "Topic Notifications"
+__description__ = "In forum groups, reading or sending in one topic only clears that topic's notifications. Other topics keep theirs. Normal chats are untouched."
+__author__ = "Justice"
+__version__ = "1.0.1"
+
+# How stock Telegram (and Nagram XF) handles reads in a forum group:
+#   * the server reports "read up to message N" for the whole group
+#     (updateReadChannelInbox), and NotificationsController.processReadMessages
+#     drops every pending notification of that group with id <= N, whatever topic
+#     it is in;
+#   * MessagesController.markDialogAsRead then calls processDialogsUpdateRead with
+#     a count of 0, which wipes the whole group's notification set.
+# Sending a message in a topic moves that group wide read mark to the new message,
+# so every other topic's notifications vanish too.
+#
+# This plugin, for forum groups only:
+#   1. stops those two group wide wipes (the calls are passed through with the
+#      forum entries taken out);
+#   2. remembers how far each TOPIC has been read (local reads, reads from other
+#      devices, and messages you send into a topic);
+#   3. removes only the notifications whose own topic has been read, then refreshes
+#      the notification shade silently (no new sound or vibration).
+# When the app reloads its pending notifications from the database (app start,
+# chat list refresh), messages of topics you already read can come back; a prune
+# pass after every reload removes them again.
+# Muting or clearing a whole group (removeNotificationsForDialog) still clears
+# everything, exactly like stock. Private chats, normal groups and channels are
+# never touched.
+
+import threading
+
+from java import jclass, jarray
+from base_plugin import BasePlugin, MethodHook, HookResult
+from hook_utils import find_class, get_private_field, get_static_private_field
+from android_utils import R, run_on_ui_thread
+
+MessagesController = jclass("org.telegram.messenger.MessagesController")
+NotificationsController = jclass("org.telegram.messenger.NotificationsController")
+NotificationCenter = jclass("org.telegram.messenger.NotificationCenter")
+LongSparseIntArray = jclass("org.telegram.messenger.support.LongSparseIntArray")
+JBoolean = jclass("java.lang.Boolean")
+JObject = jclass("java.lang.Object")
+
+INT_MAX = 2147483647
+PRUNE_DELAY_MS = 350
+
+
+def _account_of(controller):
+    try:
+        return int(get_private_field(controller, "currentAccount"))
+    except Exception:
+        return 0
+
+
+def _is_forum(account, dialog_id):
+    """True only for real forum supergroups (not mono forums, not bot forums)."""
+    try:
+        dialog_id = int(dialog_id)
+        if dialog_id >= 0:
+            return False
+        mc = MessagesController.getInstance(account)
+        return bool(mc.isForum(dialog_id)) and not bool(mc.isMonoForum(dialog_id))
+    except Exception:
+        return False
+
+
+class TopicNotificationsPlugin(BasePlugin):
+
+    def on_plugin_load(self):
+        self.read_max = {}          # (account, dialog_id, topic_id) -> highest read message id
+        self.pending = set()        # (account, dialog_id) waiting for a prune pass
+        self.clearing = set()       # (account, dialog_id) inside a stock "clear all" call
+        self.lock = threading.Lock()
+
+        nc_cls = find_class("org.telegram.messenger.NotificationsController")
+        mc_cls = find_class("org.telegram.messenger.MessagesController")
+        lsia_cls = find_class("org.telegram.messenger.support.LongSparseIntArray")
+        L = jclass("java.lang.Long").TYPE
+        I = jclass("java.lang.Integer").TYPE
+        Z = jclass("java.lang.Boolean").TYPE
+
+        self.queue = get_static_private_field(nc_cls, "notificationsQueue")
+        self.show_method = nc_cls.getDeclaredMethod("showOrUpdateNotification", Z)
+        self.show_method.setAccessible(True)
+
+        plugin = self
+
+        class ReadMessagesHook(MethodHook):
+            def before_hooked_method(self, param):
+                plugin._before_process_read_messages(param)
+
+        class DialogsUpdateReadHook(MethodHook):
+            def before_hooked_method(self, param):
+                plugin._before_dialogs_update_read(param)
+
+        class RemoveForDialogHook(MethodHook):
+            def before_hooked_method(self, param):
+                key = (_account_of(param.thisObject), int(param.args[0]))
+                with plugin.lock:
+                    plugin.clearing.add(key)
+
+            def after_hooked_method(self, param):
+                key = (_account_of(param.thisObject), int(param.args[0]))
+                with plugin.lock:
+                    plugin.clearing.discard(key)
+
+        class MarkDialogAsReadHook(MethodHook):
+            def before_hooked_method(self, param):
+                plugin._before_mark_dialog_as_read(param)
+
+        self.hook_method(nc_cls.getDeclaredMethod("processReadMessages", lsia_cls, L, I, I, Z), ReadMessagesHook())
+        self.hook_method(nc_cls.getDeclaredMethod("processDialogsUpdateRead", lsia_cls), DialogsUpdateReadHook())
+        self.hook_method(nc_cls.getDeclaredMethod("removeNotificationsForDialog", L), RemoveForDialogHook())
+        self.hook_method(mc_cls.getDeclaredMethod("markDialogAsRead", L, I, I, I, Z, L, I, Z, I), MarkDialogAsReadHook())
+
+        class ReloadHook(MethodHook):
+            def after_hooked_method(self, param):
+                plugin._after_reload(param)
+
+        for m in nc_cls.getDeclaredMethods():
+            if m.getName() == "processLoadedUnreadMessages":
+                self.hook_method(m, ReloadHook())
+
+        # Topic reads reported by the server (other devices, or the server echo of ours).
+        self.add_hook("updateReadChannelDiscussionInbox", True)
+        # Sending into a topic counts as reading that topic, like stock.
+        self.add_on_send_message_hook()
+        self.log("Topic Notifications loaded")
+
+    # ---------- topic read bookkeeping ----------
+
+    def _mark_topic_read(self, account, dialog_id, topic_id, max_id):
+        if topic_id is None or max_id is None or int(max_id) <= 0:
+            return
+        key = (account, int(dialog_id), int(topic_id))
+        with self.lock:
+            if self.read_max.get(key, 0) < int(max_id):
+                self.read_max[key] = int(max_id)
+            if len(self.read_max) > 5000:   # keep memory small
+                self.read_max.clear()
+                self.read_max[key] = int(max_id)
+
+    def _topic_read_max(self, account, dialog_id, topic_id):
+        with self.lock:
+            best = self.read_max.get((account, dialog_id, topic_id), 0)
+        try:
+            topic = MessagesController.getInstance(account).getTopicsController().findTopic(-dialog_id, topic_id)
+            if topic is not None and topic.read_inbox_max_id > best:
+                best = int(topic.read_inbox_max_id)
+        except Exception:
+            pass
+        return best
+
+    # ---------- hooks ----------
+
+    def _before_mark_dialog_as_read(self, param):
+        try:
+            account = _account_of(param.thisObject)
+            dialog_id = int(param.args[0])
+            if not _is_forum(account, dialog_id):
+                return
+            max_id = int(param.args[1])
+            thread_id = int(param.args[5])
+            if thread_id != 0:
+                # Reading inside one topic: stock never clears notifications here
+                # and relies on the group wide server echo instead. We clear this topic.
+                self._mark_topic_read(account, dialog_id, thread_id, max_id)
+            elif 0 < max_id < INT_MAX:
+                # A read with no topic (bot button, flat view): count it only for the
+                # topic of the message that was read.
+                self._schedule(account, dialog_id, read_message=max_id)
+                return
+            self._schedule(account, dialog_id)
+        except Exception as e:
+            self.log("markDialogAsRead hook: %s" % e)
+
+    def _before_process_read_messages(self, param):
+        try:
+            account = _account_of(param.thisObject)
+            inbox = param.args[0]
+            if inbox is not None:
+                kept = LongSparseIntArray()
+                changed = False
+                for i in range(inbox.size()):
+                    did = int(inbox.keyAt(i))
+                    if _is_forum(account, did):
+                        changed = True
+                        self._schedule(account, did)
+                    else:
+                        kept.put(did, inbox.valueAt(i))
+                if changed:
+                    param.args[0] = kept if kept.size() > 0 else None
+            dialog_id = int(param.args[1])
+            max_id = int(param.args[3])
+            if dialog_id != 0 and max_id != INT_MAX and _is_forum(account, dialog_id):
+                # Group wide "read up to N": neutralise it, the prune pass does it per topic.
+                param.args[1] = jclass("java.lang.Long")(0)
+                self._schedule(account, dialog_id)
+        except Exception as e:
+            self.log("processReadMessages hook: %s" % e)
+
+    def _before_dialogs_update_read(self, param):
+        try:
+            account = _account_of(param.thisObject)
+            arr = param.args[0]
+            if arr is None:
+                return
+            kept = LongSparseIntArray()
+            changed = False
+            for i in range(arr.size()):
+                did = int(arr.keyAt(i))
+                value = int(arr.valueAt(i))
+                with self.lock:
+                    clearing = (account, did) in self.clearing
+                if value == 0 and not clearing and _is_forum(account, did):
+                    changed = True   # would wipe every topic; let the prune pass decide
+                    self._schedule(account, did)
+                else:
+                    kept.put(did, value)
+            if changed:
+                param.args[0] = kept
+        except Exception as e:
+            self.log("processDialogsUpdateRead hook: %s" % e)
+
+    def _after_reload(self, param):
+        # The reload rebuilt the pending list from the database; prune every forum
+        # group in it (runs after the reload on the same queue).
+        try:
+            account = _account_of(param.thisObject)
+            seen = set()
+            dialogs = param.args[0]
+            if dialogs is not None:
+                for i in range(dialogs.size()):
+                    seen.add(int(dialogs.keyAt(i)))
+            push = param.args[2]
+            if push is not None:
+                for m in push.toArray():
+                    seen.add(int(m.getDialogId()))
+            for did in seen:
+                if _is_forum(account, did):
+                    self._schedule(account, did)
+        except Exception as e:
+            self.log("reload hook: %s" % e)
+
+    def on_update_hook(self, update_name, account, update):
+        try:
+            if "updateReadChannelDiscussionInbox" in update_name:
+                did = -int(update.channel_id)
+                if _is_forum(account, did):
+                    self._mark_topic_read(account, did, int(update.top_msg_id), int(update.read_max_id))
+                    self._schedule(account, did)
+        except Exception as e:
+            self.log("update hook: %s" % e)
+        return HookResult()
+
+    def on_send_message_hook(self, account, params):
+        try:
+            did = int(params.peer)
+            if _is_forum(account, did):
+                top = params.replyToTopMsg
+                topic_id = int(top.getId()) if top is not None else 1   # 1 = General
+                self._schedule(account, did, sent_topic=topic_id)
+        except Exception as e:
+            self.log("send hook: %s" % e)
+        return HookResult()
+
+    # ---------- prune pass (runs on the notifications queue) ----------
+
+    def _schedule(self, account, dialog_id, read_message=None, sent_topic=None):
+        key = (account, int(dialog_id))
+
+        def run():
+            try:
+                self._prune(account, int(dialog_id), read_message, sent_topic)
+            except Exception as e:
+                self.log("prune: %s" % e)
+
+        if read_message is None and sent_topic is None:
+            with self.lock:
+                if key in self.pending:
+                    return
+                self.pending.add(key)
+        self.queue.postRunnable(R(run), PRUNE_DELAY_MS)
+
+    def _prune(self, account, dialog_id, read_message, sent_topic):
+        with self.lock:
+            self.pending.discard((account, dialog_id))
+        nc = NotificationsController.getInstance(account)
+        push = get_private_field(nc, "pushMessages")
+        delayed = get_private_field(nc, "delayedPushMessages")
+        by_id = get_private_field(nc, "pushMessagesDict")
+        if push is None:
+            return
+
+        mine = []
+        for m in push.toArray():
+            if m is None or int(m.getDialogId()) != dialog_id:
+                continue
+            if m.messageOwner.from_scheduled or m.isStoryReactionPush:
+                continue
+            mine.append((m, int(m.getTopicId()), int(m.getId())))
+
+        # A read without a topic marks the topic of the read message.
+        if read_message is not None:
+            for m, tid, mid in mine:
+                if mid == read_message:
+                    self._mark_topic_read(account, dialog_id, tid, read_message)
+        # Sending into a topic reads everything pending in that topic.
+        if sent_topic is not None:
+            ids = [mid for m, tid, mid in mine if tid == sent_topic]
+            if ids:
+                self._mark_topic_read(account, dialog_id, sent_topic, max(ids))
+
+        removed = [m for m, tid, mid in mine if mid <= self._topic_read_max(account, dialog_id, tid)]
+        if not removed:
+            return
+        for m in removed:
+            push.remove(m)
+            if delayed is not None:
+                delayed.remove(m)
+            if by_id is not None:
+                arr = by_id.get(dialog_id)
+                if arr is not None:
+                    arr.remove(m.getId())
+                    if arr.size() == 0:
+                        by_id.remove(dialog_id)
+
+        if len(removed) == len(mine):
+            # Nothing left in this group: let stock do its full cleanup
+            # (counters, badge, summary). It is a "clear all" so our hooks pass it.
+            nc.removeNotificationsForDialog(dialog_id)
+        else:
+            # Silent refresh: drops the read topics' notifications, keeps the rest.
+            self.show_method.invoke(nc, jarray(JObject)([JBoolean(False)]))
+
+        def ui():
+            try:
+                popup = nc.popupMessages
+                for m in removed:
+                    popup.remove(m)
+                NotificationCenter.getGlobalInstance().postNotificationName(NotificationCenter.pushMessagesUpdated)
+            except Exception as e:
+                self.log("ui refresh: %s" % e)
+
+        run_on_ui_thread(ui)
