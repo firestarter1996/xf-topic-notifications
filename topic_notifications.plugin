@@ -1,8 +1,8 @@
 __id__ = "topic_notifications"
 __name__ = "Topic Notifications"
-__description__ = "In forum groups, reading or sending in one topic only clears that topic's notifications. Other topics keep theirs. Normal chats are untouched."
+__description__ = "In forum groups, reading or sending in one topic only clears that topic. Other topics keep their unread counts and notifications. Normal chats are untouched."
 __author__ = "Justice"
-__version__ = "1.0.3"
+__version__ = "1.0.5"
 
 # How stock Telegram (and Nagram XF) handles reads in a forum group:
 #   * the server reports "read up to message N" for the whole group
@@ -35,11 +35,29 @@ __version__ = "1.0.3"
 # Stock also never notifies about a group while any of its topics is open on
 # screen; with this plugin, new messages in OTHER topics still notify while you
 # sit in one topic. Messages in the topic you are looking at stay silent.
+# The root of the lost badges: in a group that shows topics as tabs, every group
+# wide read mark (and sending a message moves it to your own message) makes the
+# app run MessagesStorage.updateTopicsWithReadFromAllInternal, which marks EVERY
+# topic read in its database, zeroes their badges, and then clears the whole
+# group's notifications through resetForumBadgeIfNeed. Since 1.0.4 the plugin
+# skips that step for normal forum groups, unless you just read the group from
+# its All tab. Each topic then keeps its unread badge and notifications until you
+# open it or read it elsewhere.
+# The server does the same: after a send it reports every topic of a tabs group
+# as read, so the badges came back as zero whenever the app reloaded its topic list
+# (a restart, or reopening the group later). Since 1.0.5 the plugin keeps its own
+# read mark per topic in tn_reads.json and puts it back over whatever the server
+# or the database reports, with the right unread count. A mark only moves when you
+# open that topic, read it on another device, send into it, or read the All tab.
+# Every decision is written to logcat (tag TopicNotif) and to tn_log.txt in the
+# app's files folder (about 1 MB, one old copy kept).
 # Muting or clearing a whole group (removeNotificationsForDialog) still clears
 # everything, exactly like stock. Private chats, normal groups and channels are
 # never touched.
 
+import os
 import threading
+import time
 
 from java import jclass, jarray
 from base_plugin import BasePlugin, MethodHook, HookResult
@@ -54,7 +72,57 @@ JBoolean = jclass("java.lang.Boolean")
 JObject = jclass("java.lang.Object")
 
 INT_MAX = 2147483647
+ALL_TAB_WINDOW_S = 15
 PRUNE_DELAY_MS = 350
+LOG_TAG = "TopicNotif"
+LOG_MAX = 1000000
+_log_lock = threading.Lock()
+_log_path = [None]
+
+
+def _tlog(msg):
+    try:
+        jclass("android.util.Log").i(LOG_TAG, msg)
+    except Exception:
+        pass
+    try:
+        with _log_lock:
+            if _log_path[0] is None:
+                ctx = jclass("org.telegram.messenger.ApplicationLoader").applicationContext
+                _log_path[0] = os.path.join(str(ctx.getFilesDir().getAbsolutePath()), "tn_log.txt")
+            path = _log_path[0]
+            if os.path.exists(path) and os.path.getsize(path) > LOG_MAX:
+                os.replace(path, path + ".1")
+            with open(path, "a") as f:
+                f.write(time.strftime("%m-%d %H:%M:%S ") + msg + "\n")
+    except Exception:
+        pass
+
+
+def _stack():
+    out = []
+    try:
+        for e in jclass("java.lang.Exception")().getStackTrace():
+            c = str(e.getClassName())
+            if c.startswith("org.telegram") or c.startswith("tw.") or c.startswith("xyz.") or c.startswith("top."):
+                out.append("%s.%s" % (c.split(".")[-1], e.getMethodName()))
+    except Exception:
+        pass
+    return "<".join(out[:8])
+
+
+def _tabs_forum(account, dialog_id):
+    """A normal forum group (tabs or list), not a direct messages or bot forum."""
+    try:
+        dialog_id = int(dialog_id)
+        if dialog_id >= 0:
+            return False
+        chat = MessagesController.getInstance(account).getChat(-dialog_id)
+        if chat is None:
+            return False
+        return bool(chat.forum) and not bool(chat.monoforum)
+    except Exception:
+        return False
 
 
 def _account_of(controller):
@@ -86,6 +154,10 @@ class TopicNotificationsPlugin(BasePlugin):
         self.lock = threading.Lock()
         self.open_gen = 0           # bumps on every setOpenedDialogId call
         self.reentry = threading.local()
+        self.all_tab_read = {}      # (account, dialog_id) -> time of a read from the All tab
+        self.floors = {}            # (account, dialog_id) -> read mark from an All tab read
+        self.reads_path = None
+        self._load_reads()
 
         nc_cls = find_class("org.telegram.messenger.NotificationsController")
         mc_cls = find_class("org.telegram.messenger.MessagesController")
@@ -111,6 +183,8 @@ class TopicNotificationsPlugin(BasePlugin):
         class RemoveForDialogHook(MethodHook):
             def before_hooked_method(self, param):
                 key = (_account_of(param.thisObject), int(param.args[0]))
+                if _is_forum(key[0], key[1]):
+                    _tlog("removeNotificationsForDialog %d from %s" % (key[1], _stack()))
                 with plugin.lock:
                     plugin.clearing.add(key)
 
@@ -132,6 +206,13 @@ class TopicNotificationsPlugin(BasePlugin):
             def before_hooked_method(self, param):
                 with plugin.lock:
                     plugin.open_gen += 1
+                try:
+                    did = int(param.args[0])
+                    if did < 0:
+                        acc = _account_of(param.thisObject)
+                        run_on_ui_thread(lambda: plugin._reconcile(acc, did))
+                except Exception as e:
+                    _tlog("opened hook: %s" % e)
 
         class NewMessagesHook(MethodHook):
             def before_hooked_method(self, param):
@@ -154,23 +235,111 @@ class TopicNotificationsPlugin(BasePlugin):
                 self.hook_method(m, ReloadHook())
 
         # Topic reads reported by the server (other devices, or the server echo of ours).
+        ms_cls = find_class("org.telegram.messenger.MessagesStorage")
+
+        class ReadAllTopicsHook(MethodHook):
+            def before_hooked_method(self, param):
+                plugin._before_read_all_topics(param)
+
+        self.hook_method(ms_cls.getDeclaredMethod("updateTopicsWithReadFromAllInternal", L, L, L), ReadAllTopicsHook())
+
+        class ProcessTopicsHook(MethodHook):
+            def before_hooked_method(self, param):
+                plugin._before_process_topics(param)
+
+            def after_hooked_method(self, param):
+                try:
+                    acc = _account_of(param.thisObject)
+                    did = -int(param.args[0])
+                    run_on_ui_thread(lambda: plugin._reconcile(acc, did))
+                except Exception as e:
+                    _tlog("process topics after: %s" % e)
+
+        tc_cls = find_class("org.telegram.messenger.TopicsController")
+        for m in tc_cls.getDeclaredMethods():
+            if m.getName() == "processTopics":
+                self.hook_method(m, ProcessTopicsHook())
+
+
+        class CancelLogHook(MethodHook):
+            def before_hooked_method(self, param):
+                try:
+                    _tlog("CANCEL notification %s from %s" % ([str(x)[:20] for x in param.args], _stack()))
+                except Exception:
+                    pass
+
+        try:
+            nmc = find_class("androidx.core.app.NotificationManagerCompat")
+            for m in nmc.getDeclaredMethods():
+                if m.getName() in ("cancel", "cancelAll"):
+                    self.hook_method(m, CancelLogHook())
+        except Exception as e:
+            _tlog("cancel log hook: %s" % e)
+
         self.add_hook("updateReadChannelDiscussionInbox", True)
+        self.add_hook("updateReadChannelInbox", True)
         # Sending into a topic counts as reading that topic, like stock.
         self.add_on_send_message_hook()
         self.log("Topic Notifications loaded")
+        _tlog("loaded %s" % __version__)
 
     # ---------- topic read bookkeeping ----------
+
+    def _load_reads(self):
+        try:
+            import json
+            ctx = jclass("org.telegram.messenger.ApplicationLoader").applicationContext
+            self.reads_path = os.path.join(str(ctx.getFilesDir().getAbsolutePath()), "tn_reads.json")
+            if os.path.exists(self.reads_path):
+                with open(self.reads_path) as f:
+                    data = json.load(f)
+                for k, v in data.get("topics", {}).items():
+                    a, d, t = k.split("|")
+                    self.read_max[(int(a), int(d), int(t))] = int(v)
+                for k, v in data.get("floors", {}).items():
+                    a, d = k.split("|")
+                    self.floors[(int(a), int(d))] = int(v)
+            _tlog("read marks loaded: %d topics" % len(self.read_max))
+        except Exception as e:
+            _tlog("load reads: %s" % e)
+
+    def _save_reads(self):
+        try:
+            import json
+            with self.lock:
+                data = {"topics": dict(("%d|%d|%d" % k, v) for k, v in self.read_max.items()),
+                        "floors": dict(("%d|%d" % k, v) for k, v in self.floors.items())}
+            if self.reads_path:
+                tmp = self.reads_path + ".tmp"
+                with open(tmp, "w") as f:
+                    json.dump(data, f)
+                os.replace(tmp, self.reads_path)
+        except Exception as e:
+            _tlog("save reads: %s" % e)
 
     def _mark_topic_read(self, account, dialog_id, topic_id, max_id):
         if topic_id is None or max_id is None or int(max_id) <= 0:
             return
         key = (account, int(dialog_id), int(topic_id))
+        changed = False
         with self.lock:
             if self.read_max.get(key, 0) < int(max_id):
                 self.read_max[key] = int(max_id)
+                changed = True
             if len(self.read_max) > 5000:   # keep memory small
                 self.read_max.clear()
                 self.read_max[key] = int(max_id)
+        if changed:
+            self._save_reads()
+
+    def _mark(self, account, dialog_id, topic_id):
+        """This plugin's read mark for a topic, or None if it has never seen the topic."""
+        with self.lock:
+            m = self.read_max.get((account, dialog_id, topic_id))
+            f = self.floors.get((account, dialog_id))
+        if m is None and f is None:
+            return None
+        return max(m or 0, f or 0)
 
     def _topic_read_max(self, account, dialog_id, topic_id):
         # Only reads that name this topic count: a read inside the topic here, a
@@ -178,8 +347,8 @@ class TopicNotificationsPlugin(BasePlugin):
         # The app's own topic objects are not used: after a group wide read mark
         # (sending anywhere in the group) the app raises every topic's read mark
         # locally, which would wrongly clear topics you have not opened.
-        with self.lock:
-            return self.read_max.get((account, dialog_id, topic_id), 0)
+        m = self._mark(account, dialog_id, topic_id)
+        return m or 0
 
     # ---------- hooks ----------
 
@@ -191,6 +360,10 @@ class TopicNotificationsPlugin(BasePlugin):
                 return
             max_id = int(param.args[1])
             thread_id = int(param.args[5])
+            _tlog("markDialogAsRead %d max=%d topic=%d" % (dialog_id, max_id, thread_id))
+            if thread_id == 0:
+                with self.lock:
+                    self.all_tab_read[(account, dialog_id)] = time.time()
             if thread_id != 0:
                 # Reading inside one topic: stock never clears notifications here
                 # and relies on the group wide server echo instead. We clear this topic.
@@ -222,6 +395,7 @@ class TopicNotificationsPlugin(BasePlugin):
                     param.args[0] = kept if kept.size() > 0 else None
             dialog_id = int(param.args[1])
             max_id = int(param.args[3])
+            _tlog("processReadMessages dialog=%d max=%d inbox=%s" % (dialog_id, max_id, None if param.args[0] is None else int(param.args[0].size())))
             if dialog_id != 0 and max_id != INT_MAX and _is_forum(account, dialog_id):
                 # Group wide "read up to N": neutralise it, the prune pass does it per topic.
                 param.args[1] = jclass("java.lang.Long")(0)
@@ -242,6 +416,8 @@ class TopicNotificationsPlugin(BasePlugin):
                 value = int(arr.valueAt(i))
                 with self.lock:
                     clearing = (account, did) in self.clearing
+                if value <= 0 and _is_forum(account, did):
+                    _tlog("processDialogsUpdateRead %d count=%d clearing=%s blocked=%s" % (did, value, clearing, value <= 0 and not clearing))
                 if value <= 0 and not clearing and _is_forum(account, did):
                     changed = True   # would wipe every topic; let the prune pass decide
                     self._schedule(account, did)
@@ -407,6 +583,7 @@ class TopicNotificationsPlugin(BasePlugin):
                     field.setLong(nc, opened)
 
             self.queue.postRunnable(R(hide))
+            _tlog("other topics notify while in %d topic %d: %s" % (opened, opened_topic, [int(m.getTopicId()) for m in others.toArray()]))
             self.reentry.on = True
             try:
                 nc.processNewMessages(others, param.args[1], param.args[2], None)
@@ -418,11 +595,139 @@ class TopicNotificationsPlugin(BasePlugin):
             self.reentry.on = False
             self.log("new messages hook: %s" % e)
 
+    def _before_read_all_topics(self, param):
+        try:
+            st = param.thisObject
+            account = int(get_private_field(st, "currentAccount"))
+            dialog_id = int(param.args[0])
+            if not _tabs_forum(account, dialog_id):
+                return
+            with self.lock:
+                t = self.all_tab_read.get((account, dialog_id), 0)
+            if time.time() - t <= ALL_TAB_WINDOW_S:
+                _tlog("readAllTopics %d old=%d new=%d ALLOWED (All tab read)" % (dialog_id, int(param.args[1]), int(param.args[2])))
+                with self.lock:
+                    if self.floors.get((account, dialog_id), 0) < int(param.args[2]):
+                        self.floors[(account, dialog_id)] = int(param.args[2])
+                self._save_reads()
+                return
+            _tlog("readAllTopics %d old=%d new=%d SKIPPED, topics keep their own read marks" % (dialog_id, int(param.args[1]), int(param.args[2])))
+            param.setResult(None)
+        except Exception as e:
+            _tlog("read all topics hook: %s" % e)
+
+    def _before_process_topics(self, param):
+        try:
+            chat_id = int(param.args[0])
+            topics = param.args[1]
+            if topics is None or topics.size() == 0:
+                return
+            account = _account_of(param.thisObject)
+            dialog_id = -chat_id
+            from_cache = bool(param.args[3])
+            if not _tabs_forum(account, dialog_id):
+                _tlog("topics list for %d skipped, not a forum here yet" % dialog_id)
+                return
+            seen = []
+            for t in topics.toArray():
+                try:
+                    tid = int(t.id)
+                    srv = int(t.read_inbox_max_id)
+                    top = int(t.top_message)
+                except Exception:
+                    continue
+                m = self._mark(account, dialog_id, tid)
+                if m is None:
+                    # Learn a topic's mark only from the server's own list; the cached
+                    # copy can carry an old or empty read mark.
+                    if from_cache or srv <= 0:
+                        continue
+                    with self.lock:
+                        self.read_max[(account, dialog_id, tid)] = srv
+                    seen.append(tid)
+                    continue
+                if srv > m:
+                    _tlog("topic %d/%d %s says read to %d, kept at %d (top %d)" % (dialog_id, tid, "cache" if from_cache else "server", srv, m, top))
+                    t.read_inbox_max_id = m
+                    if top > m and int(t.unread_count) <= 0:
+                        t.unread_count = 1
+                if top > m:
+                    self._fix_topic_count(account, chat_id, tid, m, top)
+            if seen:
+                _tlog("first sight of topics %s in %d" % (seen, dialog_id))
+                self._save_reads()
+        except Exception as e:
+            _tlog("process topics hook: %s" % e)
+
+    def _reconcile(self, account, dialog_id):
+        """Put this plugin's read marks back on every loaded topic of a group."""
+        try:
+            if not _tabs_forum(account, dialog_id):
+                return
+            tc = MessagesController.getInstance(account).getTopicsController()
+            topics = tc.getTopics(-dialog_id)
+            if topics is None:
+                return
+            for t in topics.toArray():
+                try:
+                    tid = int(t.id)
+                    srv = int(t.read_inbox_max_id)
+                    top = int(t.top_message)
+                except Exception:
+                    continue
+                m = self._mark(account, dialog_id, tid)
+                if m is None:
+                    continue
+                if srv > m or (top > m and int(t.unread_count) <= 0):
+                    _tlog("reconcile %d/%d app says read to %d unread %d, kept at %d (top %d)" % (dialog_id, tid, srv, int(t.unread_count), m, top))
+                    t.read_inbox_max_id = m
+                    self._fix_topic_count(account, -dialog_id, tid, m, top)
+        except Exception as e:
+            _tlog("reconcile: %s" % e)
+
+    def _fix_topic_count(self, account, chat_id, tid, mark, top):
+        ms = jclass("org.telegram.messenger.MessagesStorage").getInstance(account)
+        dialog_id = -chat_id
+
+        def count():
+            try:
+                cur = ms.getDatabase().queryFinalized("SELECT count(mid) FROM messages_topics WHERE uid = %d AND topic_id = %d AND mid > %d AND out = 0" % (dialog_id, tid, mark))
+                n = 0
+                if cur.next():
+                    n = int(cur.intValue(0))
+                cur.dispose()
+                n = max(n, 1 if top > mark else 0)
+
+                def ui():
+                    try:
+                        tc = MessagesController.getInstance(account).getTopicsController()
+                        tc.updateMaxReadId(chat_id, tid, mark, n, -1)
+                        NotificationCenter.getInstance(account).postNotificationName(NotificationCenter.topicsDidLoaded, jclass("java.lang.Long")(chat_id), JBoolean(True))
+                    except Exception as e:
+                        _tlog("topic count ui: %s" % e)
+
+                    def write():
+                        try:
+                            ms.getDatabase().executeFast("UPDATE topics SET max_read_id = %d, unread_count = %d WHERE did = %d AND topic_id = %d" % (mark, n, dialog_id, tid)).stepThis().dispose()
+                        except Exception as e:
+                            _tlog("topic count write: %s" % e)
+                    ms.getStorageQueue().postRunnable(R(write))
+
+                run_on_ui_thread(ui)
+            except Exception as e:
+                _tlog("topic count: %s" % e)
+
+        ms.getStorageQueue().postRunnable(R(count))
+
     def on_update_hook(self, update_name, account, update):
         try:
+            if "updateReadChannelInbox" in update_name and "Discussion" not in update_name:
+                _tlog("server group read ch=%d max=%d still=%d" % (int(update.channel_id), int(update.max_id), int(update.still_unread_count)))
+                return HookResult()
             if "updateReadChannelDiscussionInbox" in update_name:
                 did = -int(update.channel_id)
                 if _is_forum(account, did):
+                    _tlog("server topic read %d topic=%d max=%d" % (did, int(update.top_msg_id), int(update.read_max_id)))
                     self._mark_topic_read(account, did, int(update.top_msg_id), int(update.read_max_id))
                     self._schedule(account, did)
         except Exception as e:
@@ -435,6 +740,7 @@ class TopicNotificationsPlugin(BasePlugin):
             if _is_forum(account, did):
                 top = params.replyToTopMsg
                 topic_id = int(top.getId()) if top is not None else 1   # 1 = General
+                _tlog("send %d topic=%d" % (did, topic_id))
                 self._schedule(account, did, sent_topic=topic_id)
         except Exception as e:
             self.log("send hook: %s" % e)
@@ -488,6 +794,7 @@ class TopicNotificationsPlugin(BasePlugin):
                 self._mark_topic_read(account, dialog_id, sent_topic, max(ids))
 
         removed = [m for m, tid, mid in mine if mid <= self._topic_read_max(account, dialog_id, tid)]
+        _tlog("prune %d keep=%s remove=%s" % (dialog_id, [(tid, mid) for m, tid, mid in mine if m not in removed], [(int(m.getTopicId()), int(m.getId())) for m in removed]))
         if not removed:
             return
         for m in removed:
