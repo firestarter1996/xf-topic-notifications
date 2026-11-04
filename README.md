@@ -19,6 +19,10 @@ Forum groups only:
 
 Private chats, normal groups and channels behave exactly as before. The shade refresh is silent, so no sound or vibration replays.
 
+## Known limit
+
+Opening the All tab of a tabs group marks every topic read, and their notifications clear with it. That is how the All tab reads the group, so stay in a topic's own tab when you want the other topics to keep their counts.
+
 ## Install
 
 1. Use the plugin build of Nagram XF and turn on the plugin engine (Settings, N Settings, Plugins).
