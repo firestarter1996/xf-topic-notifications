@@ -1,8 +1,8 @@
 __id__ = "topic_notifications"
 __name__ = "Topic Notifications"
-__description__ = "In forum groups, reading or sending in one topic only clears that topic. Other topics keep their unread counts and notifications. Normal chats are untouched."
-__author__ = "Justice"
-__version__ = "1.0.5"
+__description__ = "In forum groups, reading or sending in one topic only clears that topic. Other topics keep their unread counts and notifications. Normal chats are untouched. Made by [firestarter1996](https://github.com/firestarter1996)."
+__author__ = "firestarter1996"
+__version__ = "1.0.6"
 
 # How stock Telegram (and Nagram XF) handles reads in a forum group:
 #   * the server reports "read up to message N" for the whole group
